@@ -13,6 +13,10 @@ Based on the excellent [jxai/lean-conky-config](https://github.com/jxai/lean-con
 > Upstream project: [github.com/jxai/lean-conky-config](https://github.com/jxai/lean-conky-config)  
 > This repository is a derivative fork — all credit for the original design, architecture, and LCC itself belongs to Jason.
 
+<p align="center">
+  <img src="docs/screenshot.jpg" alt="Lean Conky Config on Hyprland / Omarchy — dual-stack IPv4 + IPv6 network panel" height="720">
+</p>
+
 ---
 
 ## Why this fork?
