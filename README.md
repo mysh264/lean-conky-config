@@ -9,6 +9,10 @@
 
 Based on the excellent [jxai/lean-conky-config](https://github.com/jxai/lean-conky-config), this fork ships the tweaks you actually need in 2026: a Wayland-friendly launcher, Omarchy/Hyprland-friendly defaults, and a network section that no longer pretends the internet is IPv4-only.
 
+> **Credit:** Lean Conky Config was created and is maintained by **[Jason Xu (@jxai)](https://github.com/jxai)**.  
+> Upstream project: [github.com/jxai/lean-conky-config](https://github.com/jxai/lean-conky-config)  
+> This repository is a derivative fork — all credit for the original design, architecture, and LCC itself belongs to Jason.
+
 ---
 
 ## Why this fork?
@@ -242,12 +246,25 @@ lean-conky-config/
 
 ## Credits
 
-- Original **Lean Conky Config** by [Jason Xu (@jxai)](https://github.com/jxai/lean-conky-config) — MIT
-- Conky by [Brenden Matthews](https://github.com/brndnmtthws/conky) and contributors
-- This edition: Wayland/Omarchy integration and dual-stack network panel
+### Original author
+
+**[Jason Xu (@jxai)](https://github.com/jxai)** — creator of [Lean Conky Config](https://github.com/jxai/lean-conky-config).
+
+This project would not exist without his work. The panel layout, modular component system, scaling transforms, auto device discovery, custom icon font, and the overall LCC design are his. Please star and support the [upstream repository](https://github.com/jxai/lean-conky-config) if you find Conky configs useful.
+
+### Also thanks to
+
+- [Brenden Matthews](https://github.com/brndnmtthws/conky) and the Conky contributors
+- Everyone who improved LCC through issues and pull requests upstream
+
+### This fork
+
+Wayland / Omarchy / Hyprland integration and the dual-stack IPv4 + IPv6 network panel — built on top of Jason’s LCC, not a replacement for it.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Keep the upstream copyright notice when you share or fork.
+MIT — see [LICENSE](LICENSE).
+
+Copyright for the original Lean Conky Config belongs to **Jason Xu**. This fork retains his copyright notice and adds modifications under the same MIT terms. Keep both notices when you share or fork.
