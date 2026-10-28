@@ -1,0 +1,49 @@
+-- Wayland / Hyprland / Omarchy preset.
+-- Copy to local.conf:  cp local.conf.wayland.example local.conf
+--
+-- Places the panel on the bottom Wayland layer (above wallpaper, under
+-- windows). gap_y clears a top bar / hy3 tab strip. Fonts avoid Fontconfig
+-- ":normal:" patterns that some Conky Wayland builds reject.
+
+lcc.fonts = {
+  default = T_ "Noto Sans:size=$sc{8}",
+  icon = T_ "LeanConkyConfig:size=$sc{12}",
+  icon_alt = T_ "Noto Sans:size=$sc{12}",
+  icon_s = T_ "LeanConkyConfig:size=$sc{8.5}",
+  icon_s_alt = T_ "Noto Sans:size=$sc{8.5}",
+  icon_l = T_ "LeanConkyConfig:size=$sc{20}",
+  icon_l_alt = T_ "Noto Sans:size=$sc{20}",
+  h1 = T_ "Noto Sans:style=Bold:size=$sc{10}",
+  h2 = T_ "Noto Sans:style=Bold:size=$sc{8}",
+  date = T_ "Noto Sans:size=$sc{18}",
+  week = T_ "Noto Sans:style=Bold:size=$sc{7}",
+  year = T_ "Noto Sans:size=$sc{7}",
+  time = T_ "LeanConkyConfig:size=$sc{18}",
+  time_alt = T_ "Noto Sans:style=Bold:size=$sc{18}",
+}
+
+conky.config = {
+  output_backend = "wayland",
+  own_window_type = "desktop",
+  own_window_hints = "undecorated,below,sticky,skip_taskbar,skip_pager",
+  own_window_namespace = "desktop",
+  alignment = "top_right",
+  gap_x = 20,
+  gap_y = 40,
+  own_window_transparent = true,
+  own_window_argb_value = 0,
+  own_window_color = "#00000000",
+  draw_outline = true,
+  font = T_ "Noto Sans:size=$sc{8}",
+}
+
+-- Storage omitted so the panel fits shorter displays without covering the bar.
+lcc.panel = {
+  "datetime",
+  "weather",
+  "system",
+  "cpu",
+  "memory",
+  "network",
+  { "vspace", -13 },
+}

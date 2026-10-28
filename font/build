@@ -1,0 +1,6 @@
+#!/bin/sh
+# Wrapper: suppresses FontForge startup noise unless -verbose is passed
+case "$*" in
+    *-verbose*) exec fontforge -nosplash -lang=py "$(dirname "$0")/_build.py" "$@" ;;
+    *)          exec fontforge -nosplash -lang=py "$(dirname "$0")/_build.py" "$@" 2>/dev/null ;;
+esac

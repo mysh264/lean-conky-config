@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+# vim: ft=python:ts=4:sw=4:et:ai:cin
+#
+# Check LCC (lean-conky-config) environment and runtime dependencies.
+# Usage: tools/check-lcc [-h] [-q]
+
+import os
+import sys
+import subprocess
+import argparse
+
+# ANSI color codes (suppressed when not a tty)
+_tty = sys.stdout.isatty()
+_R = "\033[31m"  # red      — critical missing
+_Y = "\033[33m"  # yellow   — optional missing
+_G = "\033[32m"  # green    — present
+_B = "\033[1m"  # bold
+_DIM = "\033[2m"  # dim
+_RST = "\033[0m"  # reset
+
+
+def _c(*codes):
+    return "".join(codes) if _tty else ""
+
+
+def _cmd_version(cmd, *args):
+    """Run `cmd args` and return first line of output, or None on failure."""
+    try:
+        out = (
+            subprocess.check_output([cmd, *args], stderr=subprocess.DEVNULL)
+            .decode()
+            .strip()
+        )
+        return out.splitlines()[0] if out else "(ok)"
+    except Exception:
+        return None
+
+
+def _pkgmgr_version(pkg_name):
+    """Return the installed version of pkg_name from dpkg, rpm, or pacman; None if not found."""
+    queries = [
+        # (command, args_template) — {pkg} replaced with pkg_name
+        ("dpkg-query", ["-W", "-f=${{Version}}", "{pkg}"]),
+        ("rpm", ["-q", "--qf", "%{{VERSION}}", "{pkg}"]),
+        ("pacman", ["-Q", "{pkg}"]),
+    ]
+    for cmd, args_tmpl in queries:
+        try:
+            out = (
+                subprocess.check_output(
+                    [cmd, *[a.format(pkg=pkg_name) for a in args_tmpl]],
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                )
+                .decode()
+                .strip()
+            )
+            if out and "not installed" not in out and "no packages" not in out:
+                # strip distro revision suffix (e.g. "12.535.133-1" → "12.535.133")
+                return out.split("-")[0]
+        except Exception:
+            continue
+    return None
+
+
+def _py_pkgmgr_version(import_name):
+    """Look up a Python package via system package managers, trying python3-*, python-*, and the bare name."""
+    for candidate in [f"python3-{import_name}", f"python-{import_name}", import_name]:
+        ver = _pkgmgr_version(candidate)
+        if ver:
+            return ver
+    return None
+
+
+def _check_python_pkg(import_name):
+    """Return '[scope] ver' for a Python package, or None if not importable.
+
+    Scope tags: [user], [venv], [system], or combinations.
+    """
+    # Script prints the version string, or nothing if importable but unknown,
+    # and exits 1 on ImportError so we can distinguish "missing" from "no version".
+    get_ver = (
+        "import sys\n"
+        f"try:\n"
+        f"    import {import_name} as _m\n"
+        f"    ver = getattr(_m, '__version__', None) or getattr(_m, 'version', None)\n"
+        f"    if not ver:\n"
+        f"        try:\n"
+        f"            import importlib.metadata\n"
+        f"            ver = importlib.metadata.version({repr(import_name)})\n"
+        f"        except Exception: pass\n"
+        f"    print(str(ver).strip() if ver else '')\n"
+        f"except ImportError: sys.exit(1)\n"
+    )
+
+    def _run(env=None):
+        """Return version string, '' if importable but unknown, None if not importable."""
+        flags = ["-s"] if env is not None else []
+        try:
+            return (
+                subprocess.check_output(
+                    ["python3", *flags, "-c", get_ver],
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    env=env,
+                )
+                .decode()
+                .strip()
+            )  # "" is falsy but not None — means importable, no version
+        except subprocess.CalledProcessError:
+            return None  # ImportError in the script
+        except Exception:
+            return None
+
+    ver = _run()
+    if ver is None:
+        return None  # not importable in current shell
+    ver = ver or "(ok)"
+
+    # Empty env: with PATH unset, execvp uses the OS compile-time default (CS_PATH),
+    # giving the bare system python3 without any venv/conda influence.
+    raw = _run(env={})  # None=absent, ""=no ver
+    sys_importable = raw is not None
+    # Falls back to dpkg/rpm/pacman when the system Python finds the package but
+    # exposes no version metadata.
+    sys_ver = raw or _py_pkgmgr_version(import_name) if raw == "" else raw
+
+    scope = "venv" if sys.prefix != sys.base_prefix else "user"
+    if not sys_importable:
+        return f"[{scope}] {ver}"
+    if sys_ver == ver:
+        return f"[{scope}, system] {ver}"
+    if sys_ver:
+        return f"[{scope}] {ver}, [system] {sys_ver}"
+    return f"[{scope}] {ver}, [system] (unknown ver.)"
+
+
+def _soname(lib):
+    """Return True if ctypes can load the shared library."""
+    try:
+        import ctypes
+
+        ctypes.CDLL(lib)
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Dependency definitions
+# ---------------------------------------------------------------------------
+# Each entry: (label, severity, check_fn, note)
+#   severity: "critical" | "optional"
+#   check_fn: callable returning version string (truthy) or None/False
+# ---------------------------------------------------------------------------
+
+
+_LCC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _get_lcc_version():
+    """Return LCC version string, appending short git commit hash if available."""
+    version = None
+    try:
+        with open(os.path.join(_LCC_ROOT, "VERSION")) as f:
+            version = f.read().strip() or None
+    except Exception:
+        pass
+
+    try:
+        commit = (
+            subprocess.check_output(
+                ["git", "-C", _LCC_ROOT, "rev-parse", "--short=6", "HEAD"],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+        # also check if working tree is dirty
+        dirty = (
+            subprocess.call(
+                ["git", "-C", _LCC_ROOT, "diff", "--quiet"],
+                stderr=subprocess.DEVNULL,
+            )
+            != 0
+        )
+        suffix = f"{commit}{'*' if dirty else ''}"
+        return f"{version} ({suffix})" if version else suffix
+    except Exception:
+        pass
+
+    return version or "(unknown)"
+
+
+def _read_os_release(path):
+    """Parse a key=value os-release file; return dict or None."""
+    try:
+        info = {}
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                k, _, v = line.partition("=")
+                info[k] = v.strip('"')
+        return info or None
+    except Exception:
+        return None
+
+
+def _get_distro():
+    """Return a short distro description string."""
+    # Standard locations (systemd spec); /usr/lib variant used on immutable distros
+    for path in ("/etc/os-release", "/usr/lib/os-release"):
+        info = _read_os_release(path)
+        if info:
+            name = info.get("PRETTY_NAME") or info.get("NAME")
+            if name:
+                return name
+
+    # Distro-specific fallback files (pre-os-release era or minimal installs)
+    _release_files = [
+        (
+            "/etc/redhat-release",
+            None,
+        ),  # RHEL / CentOS / Fedora — file contains full string
+        ("/etc/gentoo-release", None),
+        ("/etc/slackware-version", None),
+        ("/etc/alpine-release", "Alpine Linux"),  # contains only the version number
+        ("/etc/arch-release", "Arch Linux"),  # often empty; just signals Arch
+        ("/etc/debian_version", "Debian"),  # contains only version number
+    ]
+    for path, prefix in _release_files:
+        try:
+            with open(path) as f:
+                content = f.read().strip().splitlines()[0].strip()
+            if content and not prefix:
+                return content
+            if prefix:
+                return f"{prefix} {content}" if content else prefix
+        except Exception:
+            continue
+
+    # Last resort: lsb_release
+    v = _cmd_version("lsb_release", "-d")
+    if v:
+        # strip leading "Description:\t" if present
+        return v.split(":", 1)[-1].strip()
+
+    return "Unknown"
+
+
+def _get_desktop():
+    """Return the current desktop environment name, or None."""
+    env = os.environ
+    # XDG_CURRENT_DESKTOP is the canonical source (may be colon-separated, e.g. "ubuntu:GNOME")
+    de = (
+        env.get("XDG_CURRENT_DESKTOP")
+        or env.get("DESKTOP_SESSION")
+        or env.get("GDMSESSION")
+    )
+    if de:
+        return de
+    # Probe DE-specific env vars as hints when session vars are absent (e.g. run via sudo)
+    if env.get("GNOME_DESKTOP_SESSION_ID"):
+        return "GNOME"
+    if env.get("KDE_FULL_SESSION"):
+        return "KDE"
+    if env.get("SWAYSOCK"):
+        return "sway"
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "Hyprland"
+    return None
+
+
+def _get_display_server():
+    """Return 'Wayland', 'X11', or None."""
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "Wayland"
+    if os.environ.get("DISPLAY"):
+        return "X11"
+    return None
+
+
+def _check_conky():
+    v = _cmd_version("conky", "--version")
+    if not v:
+        return None
+    # extract "conky X.Y.Z" from first line
+    for tok in v.split():
+        if tok[0].isdigit():
+            return tok
+    return v
+
+
+def _check_python():
+    v = _cmd_version("python3", "--version")
+    return v.replace("Python ", "") if v else None
+
+
+def _check_lua():
+    v = _cmd_version("lua", "-v")
+    if not v:
+        v = _cmd_version("lua5.1", "-v") or _cmd_version("lua5.3", "-v")
+    return v.split()[1] if v and len(v.split()) > 1 else v
+
+
+def _check_fc_match():
+    return _cmd_version("fc-match", "--version")
+
+
+def _check_xrdb():
+    return _cmd_version("xrdb", "-version")
+
+
+def _check_xdpyinfo():
+    return _cmd_version("xdpyinfo", "-version")
+
+
+def _check_freetype():
+    return "(libfreetype.so.6)" if _soname("libfreetype.so.6") else None
+
+
+def _check_pil():
+    return _check_python_pkg("PIL")
+
+
+def _check_cairo():
+    return _check_python_pkg("cairo")
+
+
+def _check_mkfifo():
+    return _cmd_version("mkfifo", "--version")
+
+
+def _check_pynvml():
+    return _check_python_pkg("pynvml")
+
+
+_FONT_FAMILY = "LeanConkyConfig"
+_FONT_DIRS = [
+    os.path.expanduser("~/.local/share/fonts"),
+    "/usr/local/share/fonts",
+    "/usr/share/fonts",
+    os.path.expanduser("~/.fonts"),  # legacy XDG location
+]
+
+
+def _check_lcc_font():
+    """Check if the LeanConkyConfig font is installed via fc-list, falling back to dir scan."""
+    # Preferred: ask fontconfig — works on all distros that have fontconfig
+    try:
+        out = (
+            subprocess.check_output(
+                ["fc-list", _FONT_FAMILY], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
+        if out:
+            return "(installed)"
+    except Exception:
+        pass
+
+    # Fallback: scan common font directories for the .otf file
+    font_file = "lean-conky-config.otf"
+    for d in _FONT_DIRS:
+        try:
+            if any(font_file in files for _, _, files in os.walk(d)):
+                return "(installed)"
+        except Exception:
+            continue
+
+    return None
+
+
+def _check_conky_nvidia():
+    """Check if conky was compiled with nvidia support (from `conky --version` features list)."""
+    try:
+        out = subprocess.check_output(
+            ["conky", "--version"], stderr=subprocess.STDOUT
+        ).decode()
+        for line in out.splitlines():
+            if line.strip() == "* nvidia":
+                return "(compiled in)"
+        return None
+    except Exception:
+        return None
+
+
+DEPS = [
+    # ---- runtime core -------------------------------------------------------
+    ("conky", "critical", _check_conky, "the conky binary itself"),
+    ("python3", "critical", _check_python, "runs the textwidth measurement helper"),
+    (
+        "lua",
+        "critical",
+        _check_lua,
+        "scripting engine bundled with conky (or standalone)",
+    ),
+    (
+        "fc-match",
+        "critical",
+        _check_fc_match,
+        "fontconfig font resolution — no fallback if missing",
+    ),
+    # ---- DPI detection (ordered by preference) ------------------------------
+    (
+        "xrdb",
+        "optional",
+        _check_xrdb,
+        "preferred DPI source (Xft.dpi); in x11-xserver-utils / xorg-x11-server-utils",
+    ),
+    (
+        "xdpyinfo",
+        "optional",
+        _check_xdpyinfo,
+        "fallback DPI source; in x11-utils / xdpyinfo — falls back to 96 DPI if absent",
+    ),
+    # ---- text measurement backends (need at least one) ----------------------
+    (
+        "libfreetype.so.6",
+        "critical",
+        _check_freetype,
+        "primary measurement backend (ctypes, no extra install needed)",
+    ),
+    (
+        "Pillow",
+        "optional",
+        _check_pil,
+        "fallback measurement backend (apt: python3-pil / pip: Pillow)",
+    ),
+    (
+        "pycairo",
+        "optional",
+        _check_cairo,
+        "fallback measurement backend (apt: python3-cairo / pip: pycairo)",
+    ),
+    # ---- gpu component (optional, nvidia only) ------------------------------
+    (
+        "pynvml",
+        "optional",
+        _check_pynvml,
+        "recommended NVIDIA backend (apt: python3-pynvml / pip: pynvml)",
+    ),
+    (
+        "conky-nvidia",
+        "optional",
+        _check_conky_nvidia,
+        "fallback NVIDIA backend — requires conky built with --enable-nvidia",
+    ),
+    # ---- pipe infrastructure ------------------------------------------------
+    (
+        "mkfifo",
+        "critical",
+        _check_mkfifo,
+        "POSIX named-pipe creation for persistent textwidth process",
+    ),
+    # ---- lcc font (optional but recommended) --------------------------------
+    (
+        "LeanConkyConfig",
+        "optional",
+        _check_lcc_font,
+        "LCC custom font — run font/install to enable it",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+
+def _severity_label(severity, found):
+    if found:
+        return _c(_G) + "  OK  " + _c(_RST)
+    if severity == "critical":
+        return _c(_R, _B) + "MISS! " + _c(_RST)
+    return _c(_Y) + " miss " + _c(_RST)
+
+
+def run(quiet=False):
+    results = []
+    has_critical_miss = False
+    measurement_ok = False
+    dpi_ok = False
+
+    for label, severity, check_fn, note in DEPS:
+        version = check_fn()
+        found = bool(version)
+        if label in ("libfreetype.so.6", "Pillow", "pycairo") and found:
+            measurement_ok = True
+        if label in ("xrdb", "xdpyinfo") and found:
+            dpi_ok = True
+        if severity == "critical" and not found:
+            has_critical_miss = True
+        results.append((label, severity, found, version, note))
+
+    # special aggregates: need at least one from each group
+    if not measurement_ok:
+        has_critical_miss = True
+    if not dpi_ok:
+        has_critical_miss = True
+
+    col_w = max(len(r[0]) for r in results) + 2
+
+    print(_c(_B) + "LCC — environment check" + _c(_RST))
+    print(_c(_DIM) + "─" * 60 + _c(_RST))
+    print()
+    print(_c(_B, _DIM) + "Environment" + _c(_RST))
+    print(f"  {'LCC'.ljust(12)} {_get_lcc_version()}")
+    print(f"  {'Distro'.ljust(12)} {_get_distro()}")
+    de = _get_desktop()
+    print(f"  {'Desktop'.ljust(12)} {de if de else _c(_DIM) + '(unknown)' + _c(_RST)}")
+    ds = _get_display_server()
+    print(f"  {'Display'.ljust(12)} {ds if ds else _c(_DIM) + '(unknown)' + _c(_RST)}")
+
+    sections = [
+        ("Runtime core", ["conky", "python3", "lua", "fc-match"]),
+        ("DPI detection", ["xrdb", "xdpyinfo"]),
+        ("Text measurement", ["libfreetype.so.6", "Pillow", "pycairo"]),
+        ("Infrastructure", ["mkfifo"]),
+        ("GPU (optional)", ["pynvml", "conky-nvidia"]),
+        ("Font (recommended)", ["LeanConkyConfig"]),
+    ]
+
+    for section_title, labels in sections:
+        section_rows = [r for r in results if r[0] in labels]
+        if quiet and all(r[2] for r in section_rows):
+            continue
+        print()
+        print(_c(_B, _DIM) + section_title + _c(_RST))
+        for label, severity, found, version, note in results:
+            if label not in labels:
+                continue
+            if quiet and found:
+                continue
+            badge = _severity_label(severity, found)
+            name_col = (label + " ").ljust(col_w, ".")
+            ver_str = _c(_DIM) + (version if found else "") + _c(_RST)
+            print(f"  [{badge}] {name_col} {ver_str}")
+            if not found and not quiet:
+                print(_c(_DIM) + f"          {note}" + _c(_RST))
+
+    # aggregate warnings
+    if not dpi_ok:
+        print()
+        print(_c(_R, _B) + "ERROR: no DPI detection tool available." + _c(_RST))
+        print(
+            _c(_DIM)
+            + "       Install at least one of: xrdb (x11-xserver-utils), xdpyinfo (x11-utils)\n"
+            "       Without DPI detection font sizes will be wrong, causing misaligned text."
+            + _c(_RST)
+        )
+    if not measurement_ok:
+        print()
+        print(_c(_R, _B) + "ERROR: no text measurement backend available." + _c(_RST))
+        print(_c(_DIM) + "       Install Pillow or pycairo" + _c(_RST))
+
+    print()
+    print(_c(_DIM) + "─" * 60 + _c(_RST))
+    if has_critical_miss:
+        print(
+            _c(_R, _B)
+            + "Some critical dependencies are missing — LCC may not work correctly."
+            + _c(_RST)
+        )
+    else:
+        print(_c(_G) + "All critical dependencies satisfied." + _c(_RST))
+
+    return 1 if has_critical_miss else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Check LCC environment and runtime dependencies."
+    )
+    ap.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="only show missing dependencies",
+    )
+    args = ap.parse_args()
+    sys.exit(run(quiet=args.quiet))
+
+
+if __name__ == "__main__":
+    main()

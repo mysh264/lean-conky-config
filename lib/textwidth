@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+# vim: ft=python:ts=4:sw=4:et:ai:cin
+
+# Usage: textwidth [-h] [-b/--backend {auto,debug,freetype,cairo,pil}] [-v/--verbose] spec text
+#
+# Backends (auto mode tries in this order - freetype/pil match XFT/FreeType rendering):
+#   freetype  ctypes + libfreetype.so.6  (stdlib + always-present system lib)
+#   pil       Pillow                     (python3-pil, needs explicit install)
+#   cairo     pycairo                    (python3-cairo, uses different hinting path)
+import sys, os, subprocess, math, argparse, select
+
+AUTO_ORDER = ["freetype", "pil", "cairo"]
+
+
+def display_dpi():
+    # 1. Xft.dpi from X resource database — this is what XFT actually uses for
+    #    font rendering, and xrdb is available on virtually any X11 session
+    #    (x11-xserver-utils on Debian, xorg-x11-server-utils on Fedora)
+    try:
+        out = subprocess.check_output(
+            ["xrdb", "-query"], stderr=subprocess.DEVNULL
+        ).decode()
+        for line in out.splitlines():
+            if line.startswith("Xft.dpi:"):
+                return int(line.split(":", 1)[1].strip())
+    except Exception:
+        pass
+    # 2. xdpyinfo — less commonly installed (x11-utils), but a reliable fallback
+    try:
+        out = subprocess.check_output(["xdpyinfo"], stderr=subprocess.DEVNULL).decode()
+        for line in out.splitlines():
+            if "resolution:" in line:  # e.g. "  resolution:  96x96 dots per inch"
+                return int(line.split()[1].split("x")[0])
+    except Exception:
+        pass
+    return 96  # safe fallback
+
+
+def _fc_match(spec, dpi):
+    """Resolve `spec` via fontconfig at the given DPI; return (path, px, family).
+    LC_ALL=C is forced because fc-match formats fractional %{pixelsize} through
+    the locale's decimal separator — under de_DE/fr_FR/etc. it emits "21,3333"
+    and float() raises.
+    Repro: LC_ALL=de_DE.UTF-8 ./lib/textwidth "DejaVu Sans:size=16" "Hi"
+           (size=16 @ 96dpi → 21.3333px)"""
+    raw = subprocess.check_output(
+        ["fc-match", "--format=%{file}|%{pixelsize}|%{family}", f"{spec}:dpi={dpi}"],
+        env={**os.environ, "LC_ALL": "C"},
+    ).decode()
+    path, px_str, family = raw.split("|", 2)
+    return path.strip(), math.ceil(float(px_str)), family.strip()
+
+
+def resolve_font(spec):
+    """Ask fontconfig for the matched font file, pixelsize, and family name.
+    DPI is injected so size= (points) converts to the same pixelsize XFT would use."""
+    return _fc_match(spec, display_dpi())
+
+
+class FreetypeContext:
+    """Manages a FreeType library instance and caches loaded faces."""
+
+    def __init__(self):
+        import ctypes
+
+        self._ctypes = ctypes
+        self._FT = ctypes.CDLL("libfreetype.so.6")
+        self._lib = ctypes.c_void_p()
+        self._FT.FT_Init_FreeType(ctypes.byref(self._lib))
+        self._faces = {}
+        self._adv = ctypes.c_long()
+
+    def measure(self, path, px, text):
+        key = (path, px)
+        if key not in self._faces:
+            face = self._ctypes.c_void_p()
+            self._FT.FT_New_Face(self._lib, path.encode(), 0, self._ctypes.byref(face))
+            self._FT.FT_Set_Pixel_Sizes(face, 0, px)
+            self._faces[key] = face
+        face, FT, adv = self._faces[key], self._FT, self._adv
+        total = 0
+        for ch in text:
+            FT.FT_Get_Advance(
+                face, FT.FT_Get_Char_Index(face, ord(ch)), 0, self._ctypes.byref(adv)
+            )
+            total += (adv.value + 0x8000) >> 16  # round 16.16 fixed-point to integer
+        return total
+
+    def close(self):
+        for face in self._faces.values():
+            self._FT.FT_Done_Face(face)
+        self._faces.clear()
+        self._FT.FT_Done_FreeType(self._lib)
+
+
+def measure_freetype(path, px, text):
+    ctx = FreetypeContext()
+    try:
+        return ctx.measure(path, px, text)
+    finally:
+        ctx.close()
+
+
+def measure_cairo(family, px, text):
+    import cairo
+
+    ctx = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
+    ctx.select_font_face(family)  # fontconfig resolves to same file as fc-match
+    ctx.set_font_size(px)
+    return int(ctx.text_extents(text).x_advance)
+
+
+def measure_pil(path, px, text):
+    from PIL import ImageFont
+
+    return int(ImageFont.truetype(path, size=px).getlength(text))
+
+
+def _error(s):
+    return f"\033[91m{s}\033[0m" if sys.stderr.isatty() else s
+
+
+def _dispatch(backend, path, px, family, text, verbose=0):
+    # Single entry point for all backends: runs the backend, reports verbose info on
+    # success, and absorbs exceptions so callers need no try/except. Returns the pixel
+    # width on success, or None on failure.
+    try:
+        if backend == "freetype":
+            result = measure_freetype(path, px, text)
+        elif backend == "cairo":
+            result = measure_cairo(family, px, text)
+        else:
+            result = measure_pil(path, px, text)
+        if verbose >= 1:
+            print(f"backend: {backend}", file=sys.stderr)
+        return result
+    except Exception as e:
+        print(_error(f"textwidth: backend '{backend}' failed: {e}"), file=sys.stderr)
+        return None
+
+
+def serve_mode(backend="auto"):
+    """Persistent serve mode: read 'spec\\ttext' lines from stdin, print widths to stdout.
+    Caches DPI, font resolution, backend selection, and FreeType state across requests.
+    """
+    dpi = display_dpi()
+    font_cache = {}  # spec -> (path, px, family)
+    backend_cache = {}  # spec -> backend_name
+
+    # persistent FreeType context — library and faces are kept alive across requests
+    ft_ctx = [None]  # mutable container to avoid `nonlocal` (Py2 compat idiom)
+
+    def do_measure(name, path, px, family, text):
+        if name == "freetype":
+            if ft_ctx[0] is None:
+                ft_ctx[0] = FreetypeContext()
+            return ft_ctx[0].measure(path, px, text)
+        elif name == "cairo":
+            return measure_cairo(family, px, text)
+        else:
+            return measure_pil(path, px, text)
+
+    def measure(spec, text):
+        if spec not in font_cache:
+            font_cache[spec] = _fc_match(spec, dpi)
+        path, px, family = font_cache[spec]
+
+        if spec in backend_cache:
+            return do_measure(backend_cache[spec], path, px, family, text)
+        # select backend on first use of this spec
+        names = AUTO_ORDER if backend == "auto" else [backend]
+        for name in names:
+            try:
+                result = do_measure(name, path, px, family, text)
+                backend_cache[spec] = name
+                return result
+            except Exception:
+                continue
+        return None
+
+    ppid = os.getppid()
+    while True:
+        # wait for input with timeout; exit if parent process dies
+        ready, _, _ = select.select([sys.stdin], [], [], 5.0)
+        if not ready:
+            if os.getppid() != ppid:
+                break
+            continue
+        line = sys.stdin.readline()
+        if not line:
+            break  # EOF
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            print("ERR", flush=True)
+            continue
+        spec, text = parts
+        try:
+            result = measure(spec, text)
+            print(result if result is not None else "ERR", flush=True)
+        except Exception:
+            print("ERR", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Measure rendered pixel width of a string."
+    )
+    ap.add_argument(
+        "-b", "--backend", default="auto", choices=["auto", "debug"] + AUTO_ORDER
+    )
+    ap.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="show resolved font and backend on stderr (repeat for more detail)",
+    )
+    ap.add_argument(
+        "spec", nargs="?", help="fontconfig pattern, e.g. 'DejaVuSans:normal:size=16'"
+    )
+    ap.add_argument(
+        "text", nargs="?", help="string to measure (required unless --serve)"
+    )
+    ap.add_argument(
+        "--serve",
+        action="store_true",
+        help="persistent serve mode: read 'spec\\ttext' lines from stdin, print widths",
+    )
+    args = ap.parse_args()
+
+    if args.serve:
+        serve_mode(args.backend)
+        return
+
+    if not args.spec or not args.text:
+        ap.print_usage(sys.stderr)
+        sys.exit(2)
+
+    path, px, family = resolve_font(args.spec)
+    if args.verbose >= 1:
+        print(f"font: {family!r}  file: {path}  px: {px}", file=sys.stderr)
+
+    if args.backend == "auto":
+        for name in AUTO_ORDER:
+            result = _dispatch(name, path, px, family, args.text, args.verbose)
+            if result is not None:
+                print(result)
+                return
+        sys.exit(
+            _error(
+                "textwidth: no usable backend found (install python3-cairo or python3-pil)"
+            )
+        )
+    elif args.backend == "debug":
+        # Run all backends and print each result; flag any disagreement.
+        results = {}
+        for name in AUTO_ORDER:
+            r = _dispatch(name, path, px, family, args.text, verbose=0)
+            results[name] = r
+            print(f"{name}: {r}", file=sys.stderr)
+        values = [r for r in results.values() if r is not None]
+        n = len(set(values))
+        if n == 1:
+            print(values[0])
+        elif n > 1:
+            sys.exit(_error(f"textwidth: backends disagree: {results}"))
+        else:
+            sys.exit(_error("textwidth: all backends failed"))
+    else:
+        result = _dispatch(args.backend, path, px, family, args.text, args.verbose)
+        if result is None:
+            sys.exit(1)  # error already printed by _dispatch
+        print(result)
+
+
+if __name__ == "__main__":
+    main()

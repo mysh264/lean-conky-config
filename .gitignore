@@ -1,0 +1,8 @@
+local.conf
+conky-wayland
+*.code-workspace
+.vscode/
+.cursor/
+.claude/
+.codex/
+.gemini/
