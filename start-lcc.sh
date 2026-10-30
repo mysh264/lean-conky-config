@@ -64,13 +64,13 @@ font/install
 # and turns every copy of that assert into a skip (details in the tool). It
 # finds the code by its shape, so Arch (one copy), CachyOS x86-64-v3/v4 (set_font
 # also inlined in a second place) and later builds all work.
-# conky-wayland.source records which system binary the copy came from (path +
-# checksum: pacman keeps the package's old build date, so -nt is unreliable);
-# any change to the system Conky re-patches.
+# conky-wayland.source records what the copy was made from: the system binary
+# (path + checksum: pacman keeps the package's old build date, so -nt is
+# unreliable) and the patcher itself. A Conky update or a patcher fix re-patches.
 if [ "$conky_bin" = "conky" ]; then
     patched="$(pwd)/conky-wayland"
     stamp="$patched.source"
-    source_id="$system_conky $(cksum < "$system_conky")"
+    source_id="$system_conky $(cksum < "$system_conky") patcher $(cksum < tools/patch-conky-wayland)"
     if [ ! -x "$patched" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$source_id" ]; then
         rm -f "$patched" "$stamp"
         if ! command -v python3 >/dev/null 2>&1; then
