@@ -102,8 +102,8 @@ EOF
 
 Conky's Wayland output has a startup bug: `set_font()` asserts that the font list is not empty, but it runs once before the fonts are loaded, so distro builds (which keep asserts on) abort. `start-lcc.sh` works around it without touching your system Conky:
 
-1. `tools/patch-conky-wayland` copies the system `conky` to `./conky-wayland` and turns that one assert into a plain return (4 bytes change: before the fonts are loaded the call just returns; after that it works exactly as before).
-2. It finds the code by its **shape**, anchored on the binary's import of `pango_layout_set_font_description`, not by fixed bytes or addresses. So it works on Arch's build, **CachyOS's x86-64-v3/v4 rebuilds**, Omarchy, and later versions with the same code. If the shape is not there it changes nothing, warns, and runs the system Conky.
+1. `tools/patch-conky-wayland` copies the system `conky` to `./conky-wayland` and turns that assert into a skip in every copy of `set_font()` (a few bytes per copy: before the fonts are loaded the call just does nothing; after that it works exactly as before). Arch's build has one copy; CachyOS's optimized builds also inline `set_font()` into a loop, so they have two.
+2. It finds the code by its **shape**, and only patches a spot when the jump leads to the `__assert_fail` for `display_output_wayland::set_font` and the `pango_layout_set_font_description` call follows. No fixed bytes or addresses, so it works on Arch's build, **CachyOS's x86-64-v3/v4 rebuilds**, Omarchy, and later versions with the same code. If nothing matches it changes nothing, warns, and runs the system Conky.
 3. `conky-wayland.source` records which system binary the copy was made from (path + checksum). Any Conky update re-patches on the next start.
 
 Run the tool by hand to see what it does:

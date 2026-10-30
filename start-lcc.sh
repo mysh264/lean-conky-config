@@ -61,8 +61,9 @@ font/install
 # Conky's Wayland output asserts in set_font() when it runs before the fonts
 # are loaded, which happens once at startup, so distro builds (asserts on)
 # abort. tools/patch-conky-wayland copies the system binary to ./conky-wayland
-# and makes that assert a plain return (details in the tool). It finds the code
-# by its shape, so Arch, CachyOS (x86-64-v3/v4) and later builds all work.
+# and turns every copy of that assert into a skip (details in the tool). It
+# finds the code by its shape, so Arch (one copy), CachyOS x86-64-v3/v4 (set_font
+# also inlined in a second place) and later builds all work.
 # conky-wayland.source records which system binary the copy came from (path +
 # checksum: pacman keeps the package's old build date, so -nt is unreliable);
 # any change to the system Conky re-patches.
