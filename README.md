@@ -48,7 +48,7 @@ Everything else you love about LCC stays: auto-discovered NICs and disks, single
 ### 1. Install Conky
 
 ```bash
-# Arch / Omarchy
+# Arch / Omarchy / CachyOS / EndeavourOS
 sudo pacman -S conky
 
 # Debian / Ubuntu
@@ -59,6 +59,8 @@ sudo dnf install conky
 ```
 
 Need a newer build? Official AppImages: [Conky releases](https://github.com/brndnmtthws/conky/releases).
+
+Forgot this step? `start-lcc.sh` stops with `ERROR: Conky is not installed.` and the install command, and leaves any running panel alone.
 
 ### 2. Install this config
 
@@ -98,7 +100,17 @@ EOF
 
 ## Wayland / Hyprland / Omarchy
 
-`start-lcc.sh` detects when the system Conky needs a small Wayland font fix, copies `/usr/bin/conky` to `./conky-wayland`, patches it once, and launches that binary. A newer system package automatically refreshes the copy.
+Conky's Wayland output has a startup bug: `set_font()` asserts that the font list is not empty, but it runs once before the fonts are loaded, so distro builds (which keep asserts on) abort. `start-lcc.sh` works around it without touching your system Conky:
+
+1. `tools/patch-conky-wayland` copies the system `conky` to `./conky-wayland` and turns that one assert into a plain return (4 bytes change: before the fonts are loaded the call just returns; after that it works exactly as before).
+2. It finds the code by its **shape**, anchored on the binary's import of `pango_layout_set_font_description`, not by fixed bytes or addresses. So it works on Arch's build, **CachyOS's x86-64-v3/v4 rebuilds**, Omarchy, and later versions with the same code. If the shape is not there it changes nothing, warns, and runs the system Conky.
+3. `conky-wayland.source` records which system binary the copy was made from (path + checksum). Any Conky update re-patches on the next start.
+
+Run the tool by hand to see what it does:
+
+```bash
+python3 tools/patch-conky-wayland /usr/bin/conky /tmp/conky-test
+```
 
 For a transparent, bottom-layer panel that sits above the wallpaper and under windows (tuned for Omarchy’s tab bar), start from the Wayland example:
 
@@ -225,6 +237,7 @@ Disable and fall back to plain fonts:
 ## Requirements
 
 - Conky **≥ 1.10** (1.17+ recommended for reliable net graphs; Wayland users: recent system Conky)
+- `python3` — for the Wayland font fix (without it the system Conky is used as is)
 - `iproute2` (`ip` command) — for local addresses
 - `curl` — for external IP lookup
 - Optional: `pynvml` for NVIDIA GPU component
@@ -240,6 +253,7 @@ lean-conky-config/
 ├── local.conf.wayland.example
 ├── main.lua
 ├── start-lcc.sh            # launcher (+ Wayland helper)
+├── tools/patch-conky-wayland  # makes ./conky-wayland (Wayland font-bug fix)
 ├── lib/                    # components, utils, templates
 ├── font/                   # LeanConkyConfig.otf + installer
 ├── docs/                   # upstream docs & screenshot

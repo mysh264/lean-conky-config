@@ -1,5 +1,7 @@
 local.conf
 conky-wayland
+conky-wayland.source
+.conky-wayland.*
 *.code-workspace
 .vscode/
 .cursor/

@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Make a copy of Conky that survives its Wayland startup font bug.
+
+Conky's Wayland output (src/output/display-wayland.cc) does
+
+    void display_output_wayland::set_font(unsigned int f) {
+      assert(f < pango_fonts.size());
+      if (pango_fonts.size() > f && pango_fonts[f].desc != nullptr) {
+        pango_layout_set_font_description(global_window->layout, pango_fonts[f].desc);
+      }
+    }
+
+and calls set_font() once before load_fonts() has filled pango_fonts. Distro
+builds keep asserts on, so Conky aborts at startup on Wayland. Without the
+assert the function would simply do nothing, which is what we want.
+
+This tool copies the Conky binary and, in the copy, points the assert's jump
+at the function's own `ret` (the same `ret` its "desc == nullptr" check
+already uses). Nothing else changes.
+
+The function is found without symbols and without fixed addresses, so it
+works on Arch's build, CachyOS's x86-64-v3/v4 rebuilds and later versions
+with the same code shape:
+  1. read the GOT slot of pango_layout_set_font_description from the ELF's
+     dynamic relocations;
+  2. find the code that tail-jumps through that slot;
+  3. check the exact instruction shape around it (bounds check -> assert,
+     null check -> ret) and patch only if there is exactly one match.
+
+Usage: patch-conky-wayland SRC DST
+Exit:  0 patched copy written to DST
+       3 this Conky build does not have the expected code (nothing written)
+       1 other error (nothing written)
+"""
+import os
+import re
+import shutil
+import struct
+import sys
+import tempfile
+
+TARGET_SYMBOL = b"pango_layout_set_font_description"
+R_X86_64_GLOB_DAT = 6
+R_X86_64_JUMP_SLOT = 7
+
+# cmp rsi,rax ; jae <assert>        ; lea rax,[rsi+rsi*2] ; mov rsi,[rdx+rax*8]
+# test rsi,rsi ; je <ret>
+SHAPE = re.compile(
+    rb"\x48\x39\xc6\x0f\x83(?P<jae>[\s\S]{4})"
+    rb"\x48\x8d\x04\x76\x48\x8b\x34\xc2\x48\x85\xf6\x74(?P<je>[\s\S])"
+)
+
+
+class Unsupported(Exception):
+    pass
+
+
+def sections(data):
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        raise Unsupported("not a 64-bit little-endian ELF file")
+    if struct.unpack_from("<H", data, 18)[0] != 62:
+        raise Unsupported("not an x86-64 binary")
+    shoff = struct.unpack_from("<Q", data, 0x28)[0]
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x3A)
+    raw = [struct.unpack_from("<IIQQQQIIQQ", data, shoff + i * shentsize) for i in range(shnum)]
+    names_off = raw[shstrndx][4]
+
+    def name(off):
+        end = data.index(b"\0", names_off + off)
+        return data[names_off + off:end].decode()
+
+    return [
+        {"name": name(s[0]), "type": s[1], "addr": s[3], "offset": s[4],
+         "size": s[5], "link": s[6], "entsize": s[9]}
+        for s in raw
+    ]
+
+
+def got_slot(data, secs):
+    """Address of the GOT entry the binary uses for TARGET_SYMBOL."""
+    for sec in secs:
+        if sec["type"] != 4 or sec["link"] == 0:  # SHT_RELA with a symbol table
+            continue
+        symtab = secs[sec["link"]]
+        strtab = secs[symtab["link"]]
+        for i in range(sec["size"] // 24):
+            r_offset, r_info, _ = struct.unpack_from("<QQq", data, sec["offset"] + i * 24)
+            if r_info & 0xFFFFFFFF not in (R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT):
+                continue
+            st_name = struct.unpack_from("<I", data, symtab["offset"] + (r_info >> 32) * 24)[0]
+            start = strtab["offset"] + st_name
+            if data[start:data.index(b"\0", start)] == TARGET_SYMBOL:
+                return r_offset
+    raise Unsupported(f"no relocation for {TARGET_SYMBOL.decode()} (not a Wayland-enabled Conky?)")
+
+
+def find_patch(data, secs):
+    text = next((s for s in secs if s["name"] == ".text"), None)
+    if text is None:
+        raise Unsupported("no .text section")
+    slot = got_slot(data, secs)
+    base, end = text["offset"], text["offset"] + text["size"]
+    code = data[base:end]
+
+    def vma(off):  # file offset -> virtual address
+        return off - text["offset"] + text["addr"]
+
+    hits = []
+    for m in SHAPE.finditer(code):
+        jae_off = base + m.start() + 3                 # 0f 83 rel32
+        je_off = base + m.end() - 2                    # 74 rel8
+        ret_off = je_off + 2 + struct.unpack("<b", m.group("je"))[0]
+        if not (base <= ret_off < end) or data[ret_off] != 0xC3:
+            continue
+        # The tail call through the GOT slot sits between the je and the ret.
+        window = data[je_off + 2:ret_off]
+        tail_call = False
+        for j in re.finditer(rb"\xff\x25", window):
+            off = je_off + 2 + j.start()
+            if off + 6 > ret_off:
+                break
+            rel = struct.unpack_from("<i", data, off + 2)[0]
+            if vma(off) + 6 + rel == slot:
+                tail_call = True
+                break
+        if tail_call:
+            hits.append((jae_off, ret_off))
+
+    if len(hits) != 1:
+        raise Unsupported(f"expected one set_font() match, found {len(hits)}")
+    jae_off, ret_off = hits[0]
+    new_rel = ret_off - (jae_off + 6)
+    already = struct.unpack_from("<i", data, jae_off + 2)[0] == new_rel
+    return jae_off, new_rel, already
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("usage: patch-conky-wayland SRC DST", file=sys.stderr)
+        return 1
+    src, dst = sys.argv[1], sys.argv[2]
+    try:
+        data = bytearray(open(src, "rb").read())
+        jae_off, new_rel, already = find_patch(bytes(data), sections(data))
+    except Unsupported as err:
+        print(f"patch-conky-wayland: {src}: {err}", file=sys.stderr)
+        return 3
+    except (OSError, ValueError, IndexError, struct.error) as err:
+        print(f"patch-conky-wayland: {src}: {err}", file=sys.stderr)
+        return 1
+
+    if not already:
+        data[jae_off + 2:jae_off + 6] = struct.pack("<i", new_rel)
+
+    # Write next to DST and rename, so a failure never leaves a half-patched copy.
+    fd, tmp = tempfile.mkstemp(prefix=".conky-wayland.", dir=os.path.dirname(os.path.abspath(dst)))
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+        shutil.copymode(src, tmp)
+        os.chmod(tmp, os.stat(tmp).st_mode | 0o111)
+        os.replace(tmp, dst)
+    except OSError as err:
+        os.unlink(tmp)
+        print(f"patch-conky-wayland: {dst}: {err}", file=sys.stderr)
+        return 1
+    state = "already patched, copied" if already else "patched"
+    print(f"patch-conky-wayland: {state} set_font() at file offset {jae_off:#x} -> {dst}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
